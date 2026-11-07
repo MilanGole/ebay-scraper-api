@@ -6,7 +6,8 @@ from parsel import Selector
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from starlette.concurrency import run_in_threadpool
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.dialects.postgresql import insert
 
@@ -34,12 +35,13 @@ class EbayItem(Base):
     condition = Column(String(100))
     price = Column(String(50))
     url = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 # Make sure tables exist in Supabase
 Base.metadata.create_all(bind=engine)
 
 # 4. FastAPI Setup
-app = FastAPI(title="eBay Scraper API + Supabase Postgres", version="2.0")
+app = FastAPI(title="eBay Scraper API + Supabase Postgres", version="2.1")
 
 
 def extract_item_id(url: str) -> str:
@@ -64,7 +66,6 @@ def save_to_supabase(scraped_data: list[dict]):
     db = SessionLocal()
     try:
         for item in scraped_data:
-            # PostgreSQL UPSERT: insert if new, update title/price if item_number exists
             stmt = insert(EbayItem).values(
                 ebay_item_number=item["ebay_item_number"],
                 title=item["title"],
@@ -76,7 +77,8 @@ def save_to_supabase(scraped_data: list[dict]):
                 set_={
                     "title": item["title"],
                     "price": item["price"],
-                    "condition": item["condition"]
+                    "condition": item["condition"],
+                    "updated_at": func.now()
                 }
             )
             db.execute(stmt)
@@ -122,6 +124,10 @@ async def run_ebay_scraper(target_url: str, limit: int = 10) -> list[dict]:
                 if not url or url in seen_urls:
                     continue
 
+                item_id = extract_item_id(url)
+                if item_id == "N/A":
+                    continue  # Prevents unique constraint violation crashes on null/invalid item IDs
+
                 title_parts = item.css("h3.bsig__title__text ::text, .s-item__title ::text").getall()
                 full_title = " ".join([t.strip() for t in title_parts if t.strip()])
                 clean_title = full_title.replace("New listing", "").strip()
@@ -134,8 +140,6 @@ async def run_ebay_scraper(target_url: str, limit: int = 10) -> list[dict]:
 
                 price = item.css(".bsig__price--displayprice::text, .s-item__price::text").get()
                 clean_price = price.strip() if price else "N/A"
-
-                item_id = extract_item_id(url)
 
                 seen_urls.add(url)
                 scraped_data.append(
@@ -161,14 +165,14 @@ async def scrape_endpoint(
     target_url: str = Query(..., description="The eBay category or search page URL"),
     limit: int = Query(10, ge=1, le=50, description="Number of items to return")
 ):
-    # 1. Scrape Data
+    # 1. Scrape Data asynchronously
     scraped_data = await run_ebay_scraper(target_url, limit)
     
     if not scraped_data:
         return {"status": "warning", "message": "No items matched selectors", "data": []}
 
-    # 2. Save Data directly to Supabase Postgres
-    save_to_supabase(scraped_data)
+    # 2. Save Data safely in a background threadpool to avoid blocking FastAPI's event loop
+    await run_in_threadpool(save_to_supabase, scraped_data)
 
     return {
         "status": "success",
